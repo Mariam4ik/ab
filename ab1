@@ -1,0 +1,68 @@
+Задача:
+    Провести AA тест 
+    Период с '2022-09-26' по '2022-10-02'. Вам нужно сделать симуляцию, как будто мы провели 10000 АА-тестов. На каждой итерации вам нужно сформировать подвыборки без повторения в 500 юзеров из 2 и 3 экспериментальной группы. Провести сравнение этих подвыборок t-testом.
+Построить гистограмму распределения получившихся 10000 p-values.Посчитать, какой процент p values оказался меньше либо равен 0.05Написать вывод по проведенному АА-тесту, корректно ли работает наша система сплитования.Пришлите ссылку на merge request c проведенным анализом.
+
+#импортируем библиотеки
+import pandahouse
+import seaborn as sns
+from scipy import stats
+import pandas as pd
+
+#создадим связь с кликхаусом
+connection={'host':'https://clickhouse.lab.karpov.courses', 
+            'database':'simulator_20221020',
+            'user':'student',
+            'password':'dpo_python_2020'
+           }
+
+#выведем данные, заранее сформировав в кликхаусе табличку
+q = """
+SELECT exp_group, 
+    user_id,
+    sum(action = 'like') as likes,
+    sum(action = 'view') as views,
+    likes/views as ctr
+FROM {db}.feed_actions 
+WHERE toDate(time) between '2022-09-26' and  '2022-10-02'
+    and exp_group in (2,3)
+GROUP BY exp_group, user_id
+"""
+
+df = pandahouse.read_clickhouse(q, connection=connection)
+
+#Проверим кол-во в каждой группе
+df.groupby('exp_group').count()
+
+#Создадим пустой спискок для будущих ctr
+list_of_ctr=[]
+
+#проведем t-test 10000 раз для подгрупп из 500 для каждой из исследуемых групп 2 и 3
+for i in range(10000):
+    df_test2=df[df.exp_group == 2].sample(500)
+    df_test3=df[df.exp_group == 3].sample(500)
+    # Проводим Т-Тест
+    result = stats.ttest_ind(df_test2.ctr,
+                    df_test3.ctr,
+                    equal_var = False)
+    # Записываем результат текущего t-Теста   
+    list_of_ctr.append(result[1])
+
+ #Записываем результаты t-Теста в df
+df_of_ctr = pd.DataFrame(list_of_ctr)
+#переименовываю название столбца
+df_of_ctr = df_of_ctr.rename(columns={0: 'p_val'})
+
+#Строим гистограмму полученных результатов
+groups = sns.histplot(data = df_of_ctr, 
+              x='p_val', 
+              alpha=0.5,
+              kde=False)
+
+dolya_005 = 100*df_of_ctr[df_of_ctr.p_val <= 0.05].count()/len(df_of_ctr)
+print('Проведено A/A тестирование, в ходе которого из групп 2 и 3 для эксперимента 10 тысяч раз' '\n' 'были рандомно созданы подгруппы из 500 пользователей и проводился t-test. Сравнивался их ctr.''\n'
+      'Доля статистически значимых отличий меду выборками составляет', dolya_005[0], '%')
+
+Проведено A/A тестирование, в ходе которого из групп 2 и 3 для эксперимента 10 тысяч раз
+были рандомно созданы подгруппы из 500 пользователей и проводился t-test. Сравнивался их ctr.
+Доля статистически значимых отличий меду выборками составляет 4.34 %
