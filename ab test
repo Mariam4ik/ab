@@ -1,0 +1,316 @@
+Эксперимент проходил с 2022-10-03 по 2022-10-09 включительно. Для эксперимента были задействованы 2 и 1 группы
+В группе 2 был использован один из новых алгоритмов рекомендации постов, группа 1 использовалась в качестве контроля. 
+Выбрать метод анализа и сравнить CTR в двух группах (мы разбирали t-тест, Пуассоновский бутстреп, тест Манна-Уитни, t-тест на сглаженном ctr (α=5) а также t-тест и тест Манна-Уитни поверх бакетного преобразования).Сравните данные этими тестами. А еще посмотрите на распределения глазами. Почему тесты сработали так как сработали? Опишите потенциальную ситуацию, когда такое изменение могло произойти. Тут нет идеального ответа, подумайте.Напишите рекомендацию, будем ли мы раскатывать новый алгоритм на всех новых пользователей или все-таки не стоит.
+
+import pandahouse
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+import hashlib # Делать хеши
+#import swifter # Ускорялка метода apply
+from scipy import stats # Статистика
+%matplotlib inline
+import matplotlib.pyplot as plt
+
+connection={'host':'https://clickhouse.lab.karpov.courses', 
+            'database':'simulator_20221020',
+            'user':'student',
+            'password':'dpo_python_2020'
+           }
+
+Для начала проведу АА тест для групп 1 и 2 в период за between '2022-09-26' and '2022-10-02'
+и построю гистограмму, и рассчитаю p value
+
+q = """
+SELECT exp_group, 
+    user_id,
+    sum(action = 'like') as likes,
+    sum(action = 'view') as views,
+    likes/views as ctr
+FROM {db}.feed_actions 
+WHERE toDate(time) between '2022-09-26' and '2022-10-02'
+    and exp_group in (1,2)
+GROUP BY exp_group, user_id
+"""
+
+
+df = pandahouse.read_clickhouse(q, connection=connection)
+
+# Сделаем графики в seaborn покрупнее
+sns.set(rc={'figure.figsize':(11.7,8.27)})
+
+groups = sns.histplot(data = df, 
+              x='ctr', 
+              hue='exp_group', 
+              palette = ['r', 'b'],
+              alpha=0.5,
+              kde=False)
+
+stats.ttest_ind(df[df.exp_group == 1].ctr,
+                df[df.exp_group == 2].ctr,
+                equal_var=False)
+
+Ttest_indResult(statistic=-2.017208642179449, pvalue=0.04368941747573785)
+
+ Графики выглядя схоже, p-value < 5%.
+Согласно классическому пониманию статистической значимости данные выборок принадлежат разным генеральным совокупностям. И отличия считаются существенными. Приступим к AB тесту Проведем t-test
+
+# выведу с помощью запроса в кликхаус необходимую таблицу, для дальнейшего её анализа
+q = """
+SELECT exp_group, 
+    user_id,
+    sum(action = 'like') as likes,
+    sum(action = 'view') as views,
+    likes/views as ctr
+FROM {db}.feed_actions 
+WHERE toDate(time) between '2022-10-03' and '2022-10-10'
+    and exp_group in (1,2)
+GROUP BY exp_group, user_id
+"""
+
+
+df = pandahouse.read_clickhouse(q, connection=connection)
+
+#выведу 10 значений созданной дф
+df.head(10)
+
+ #проверим сколько пользователей в каждой группе
+df.groupby('exp_group').count()
+# около 10 тысяч, вполне прилично, а главное что группы более-менее равны
+
+groups = sns.histplot(data = df, 
+              x='ctr', 
+              hue='exp_group', 
+              palette = ['r', 'b'],
+              alpha=0.5,
+              kde=False)
+
+Интересная визуализация. Мы видим что распределение ctr в контрольной группе приближено к нормальному, одномодальное
+В тестовой группе распределение бимодально. 
+Выглядит так, будто для части пользователей нововведение ухудшило ctr, а для второй части группы ctr улучшился, т.е. вырос.
+Тем не менее посчитаем статистику и p-value
+
+# Считаем посредством t-test
+stats.ttest_ind(df[df.exp_group == 1].ctr,
+                df[df.exp_group == 2].ctr,
+                equal_var=False)
+
+ Ttest_indResult(statistic=1.0575662174048006, pvalue=0.29026792376841526)
+
+#Выведем средний ctr для каждой из групп
+df[df.exp_group == 1].ctr.mean(), df[df.exp_group == 2].ctr.mean()
+
+(0.21612779734656784, 0.21449808695941755)
+
+ Да, p-value говорит нам что тест не прокрасился. Выборки принадлежат одной совокупности.
+К тому же и средние очень похожи ;)
+Но благодаря тому что мы увидели глазами как распределены ctr в контрольной и тестовой 
+группах мы не остановимся на этом и проведем данные через тест Мана Уитни
+
+#сделаем t-test встроенной в кликхаус возможностью
+ttest_house = """
+
+WITH welchTTest(ctr, exp_index) as ttest
+
+select tupleElement(ttest,1) as statistic,
+    tupleElement(ttest,2) as p_value
+FROM (SELECT exp_group, 
+        case when exp_group = 1 then 0 else 1 end as exp_index,
+        user_id, 
+        sum(action = 'like') as likes,
+        sum(action = 'view') as views,
+        likes/views as ctr
+    FROM {db}.feed_actions 
+    WHERE toDate(time) between '2022-10-03' and '2022-10-10'
+        and exp_group in (1,2)
+    GROUP BY exp_group, user_id)
+"""
+
+
+pandahouse.read_clickhouse(ttest_house, connection=connection)
+
+statistic 1.057566
+p_value  0.290268
+
+
+Кортеж с данными выдает нам p-value = 0,29. Что также говорит нам о том что тест не прокрасился. Проведем тест Мана-Уитни
+
+# Проведем тест Манна-Уитни
+stats.mannwhitneyu(df[df.exp_group == 1].ctr, 
+                   df[df.exp_group == 2].ctr,
+                   alternative = 'two-sided')
+
+MannwhitneyuResult(statistic=62926913.0, pvalue=2.4914156131866587e-48)
+
+О, как интересно, тест Манна-Уитни прокрасился. Он говорит что изменения в ctr в контрольной и тестируемой группах существенны 
+Сглаженный CTR
+
+# функция, которая рассчитает нам новый ctr
+def get_smothed_ctr(user_likes, user_views, global_ctr, alpha):
+    smothed_ctr = (user_likes + alpha * global_ctr) / (user_views + alpha)
+    return smothed_ctr
+
+# Рассчитаем глобальный ctr для каждой из групп
+global_ctr_1 = df[df.exp_group == 1].likes.sum()/df[df.exp_group == 1].views.sum()
+global_ctr_2 = df[df.exp_group == 2].likes.sum()/df[df.exp_group == 2].views.sum()
+
+#выделим отдельно две группы по полю exp_group для дальнейшей прогрузки в функцию по вычислению сглаженного ctr
+group_1 = df[df.exp_group == 1].copy()
+group_2 = df[df.exp_group == 2].copy()
+
+#подставляем все необходимые данные в функцию get_smothed_ctr
+group_1['smothed_ctr'] = (
+    group_1
+    .apply(
+        lambda x: get_smothed_ctr(x['likes'], x['views'], global_ctr_1, 5), 
+        axis=1
+    )
+)
+
+group_2['smothed_ctr'] = (
+    group_2
+    .apply(
+        lambda x: get_smothed_ctr(x['likes'], x['views'], global_ctr_2, 5), 
+        axis=1
+    )
+)
+
+#рассчитаем t-test
+stats.ttest_ind(group_1['smothed_ctr'],
+                group_2['smothed_ctr'],
+                equal_var=False)
+
+ Ttest_indResult(statistic=2.4174415610983515, pvalue=0.01564036189963057)
+
+#рассчитаем по Манну-Уитни
+stats.mannwhitneyu(group_1['smothed_ctr'], 
+                   group_2['smothed_ctr'],
+                   alternative = 'two-sided')
+
+MannwhitneyuResult(statistic=63270385.0, pvalue=2.3470504492387277e-53)
+
+ Сглаженный CTR в t-test наконец тоже прокрасился, значение p-value < 5%. Возможно в исходных данных были выбросы, которые смазали нам картинку. 
+Избавившись от них с помощью сглаживания ctr мы видим значимые отличия в выборках.
+Тест Манна Уитни по-прежнему прокрашивается.
+
+# посмотрим на гистограмму при сглаженном ctr
+sns.histplot(group_1['smothed_ctr'],
+             color='b',
+             alpha=0.5,
+             kde=False);
+sns.histplot(group_2['smothed_ctr'],
+             color='g',
+             alpha=0.5,
+             kde=False);
+plt.legend(labels=['Control group', 'Test group']);
+
+Пуассоновский бутстреп:
+#объявим функцию bootstrap
+def bootstrap(likes_1, views_1, likes_2, views_2, n_bootstrap=2000):
+    poisson_bootstraps_1 = stats.poisson(1).rvs((n_bootstrap, len(likes_1))).astype(np.int64)
+    poisson_bootstraps_2 = stats.poisson(1).rvs((n_bootstrap, len(likes_2))).astype(np.int64)
+    global_ctr_1 = (poisson_bootstraps_1*likes_1).sum(axis=1)/(poisson_bootstraps_1*views_1).sum(axis=1)
+    global_ctr_2 = (poisson_bootstraps_2*likes_2).sum(axis=1)/(poisson_bootstraps_2*views_2).sum(axis=1)
+    return global_ctr_1, global_ctr_2
+
+# выведем необходимые данные для использовании в функции
+likes_1 = df[df.exp_group == 1]['likes'].to_numpy()
+views_1 = df[df.exp_group == 1]['views'].to_numpy()
+likes_2 = df[df.exp_group == 2]['likes'].to_numpy()
+views_2 = df[df.exp_group == 2]['views'].to_numpy()
+
+# рассчитаем ctr  используя заданную функцию
+ctr_1, ctr_2 = bootstrap(likes_1, views_1, likes_2, views_2)
+
+ # Построим графики
+sns.histplot(ctr_1, color='g')
+sns.histplot(ctr_2, color='b')
+plt.legend(labels=['Control group', 'Test group']);
+plt.show()
+
+Получили весьма неожиданные результаты. В результате Пуассоновского бутсрепа данные так отличаются, что даже не пересекаются.
+Причем контрольная группа показывает CTR выше, чем тестовая.
+
+#Построим распределение разности глобальных CTR
+sns.histplot(ctr_1 - ctr_2, color = 'grey')
+
+<AxesSubplot:ylabel='Count'>
+
+ Распределение положительно и отсутствует 0. Выборки совершенно разные.  
+
+Бакетное преобразование:
+backet = """
+
+SELECT exp_group, bucket,
+    sum(likes)/sum(views) as bucket_ctr,
+    quantileExact(0.75)(ctr) as ctr75
+FROM (SELECT exp_group, 
+        xxHash64(user_id)%50 as bucket,
+        user_id,
+        sum(action = 'like') as likes,
+        sum(action = 'view') as views,
+        likes/views as ctr
+    FROM {db}.feed_actions 
+    WHERE toDate(time) between '2022-10-03' and '2022-10-10'
+    and exp_group in (1,2)
+    GROUP BY exp_group, bucket, user_id)
+GROUP BY exp_group, bucket
+"""
+
+df = pandahouse.read_clickhouse(backet, connection=connection)
+
+ #рассчитаем по Ману-Уитни
+pvalue_mann=stats.mannwhitneyu(df[df.exp_group == 1].bucket_ctr, 
+                   df[df.exp_group == 2].bucket_ctr, 
+                   alternative = 'two-sided').pvalue
+
+#рассчитаем t-test
+pvalue_ttest=stats.ttest_ind(df[df.exp_group == 1].bucket_ctr,
+                df[df.exp_group == 2].bucket_ctr,
+                equal_var=False).pvalue
+
+print(f'      T-test pvalue: {pvalue_mann}',
+      f'Mann-Whitney pvalue: {pvalue_ttest}', sep='\n')
+
+       T-test pvalue: 7.045566667668902e-07
+Mann-Whitney pvalue: 1.4596015329482579e-06
+
+При бакетном преобразовании pvalue в обоих случаях маленький. Тест прокрашивается.
+
+#Интересно как сбея покажет кванитль 75
+#рассчитаем по Ману-Уитни
+pvalue_mann75=stats.mannwhitneyu(df[df.exp_group == 1].ctr75, 
+                   df[df.exp_group == 2].ctr75, 
+                   alternative = 'two-sided').pvalue
+
+#рассчитаем t-test
+pvalue_ttest75=stats.ttest_ind(df[df.exp_group == 1].ctr75,
+                df[df.exp_group == 2].ctr75,
+                equal_var=False).pvalue
+
+print(f'      T-test pvalue 75: {pvalue_mann}',
+      f'Mann-Whitney pvalue 75: {pvalue_ttest}', sep='\n')
+
+      T-test pvalue 75: 6.820014862693958e-18
+Mann-Whitney pvalue 75: 7.747059420677053e-41
+
+#распределение ctr в бакетах
+
+sns.histplot(df[df.exp_group == 1].bucket_ctr, color='g', bins=20)
+sns.histplot(df[df.exp_group == 2].bucket_ctr, color='b', bins=30)
+plt.legend(labels=['Control group', 'Test group']);
+plt.show()
+
+Среднее тестовой группы смещено и выглядит ниже контрольной группы. То есть бакетное преобразование не рекомендует нам выкатывать обновления. 
+
+Выводы:
+Проведенный АА тест уже был подозрителен. Важно оценивать распределение глазами, так как в случае бимодальности классический t-test не используется, 
+так как нет нормального распределения.Тест Мана-Уитни оказывается в таких случаях точнее.Можно отметить, что ctr в бакетах и бутстрепе оказался выше 
+в контрольной группе, чем в тестовойСглаженный ctr хорошо повлиял даже на t-test, и начал прокрашиваться. 
+В тесте Мана-Уитни тоже показатель pvalue усилился из е-48 до е-53По итогу я бы не рекомендовала выкатывать обновления в том виде которые есть, 
+предварительно не разобравшись в чем причина бимодальности тестовой группы. Возможно пока выясняют причины бимодальности можно было бы продлить эксперимент, 
+понаблюдать за ctr в тестовой группе, возможно он выровняется, либо сместится в какую-то одну сторону.
+
+
+      
